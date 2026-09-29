@@ -599,7 +599,7 @@
         "testfox.autoRunOnCommit": {
           "type": "boolean",
           "default": false,
-          "description": "Automatically run tests after major commits"
+          "description": "Offer to run tests when a new commit is made on the current branch (runs without asking if testfox.automation.autoRunWithoutPrompts is enabled)"
         },
         "testfox.scheduleEnabled": {
           "type": "boolean",

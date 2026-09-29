@@ -1,16 +1,38 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
-import * as fs from 'fs';
+import { runBackgroundTests, BackgroundTestResult } from './backgroundTestRunner';
+import { HeadSnapshot, isNewCommit } from './commitDetection';
+
+/**
+ * Minimal subset of the built-in vscode.git extension API (v1) used here.
+ */
+interface GitRepository {
+    rootUri: vscode.Uri;
+    state: {
+        HEAD?: HeadSnapshot;
+        onDidChange: vscode.Event<void>;
+    };
+}
+
+interface GitAPI {
+    repositories: GitRepository[];
+    onDidOpenRepository: vscode.Event<GitRepository>;
+    onDidCloseRepository: vscode.Event<GitRepository>;
+}
 
 /**
  * Git Commit Hook - Automatically triggers tests on git commit
+ *
+ * Listens to repository state changes from the built-in Git extension
+ * (no polling) and prompts to run tests when a new commit lands on the
+ * current branch. Controlled by the `testfox.autoRunOnCommit` setting.
  */
-export class GitCommitHook {
+export class GitCommitHook implements vscode.Disposable {
     private context: vscode.ExtensionContext;
     private outputChannel: vscode.OutputChannel;
     private isWatching: boolean = false;
-    private lastCommitHash: string | null = null;
-    private checkInterval: NodeJS.Timeout | null = null;
+    private apiListeners: vscode.Disposable[] = [];
+    private repoListeners = new Map<string, vscode.Disposable>();
+    private lastHeads = new Map<string, HeadSnapshot>();
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
@@ -18,138 +40,122 @@ export class GitCommitHook {
     }
 
     /**
+     * Start or stop watching to match the current `testfox.autoRunOnCommit` setting
+     */
+    async refresh(): Promise<void> {
+        const config = vscode.workspace.getConfiguration('testfox');
+        if (config.get<boolean>('autoRunOnCommit', false)) {
+            await this.startWatching();
+        } else {
+            this.stopWatching();
+        }
+    }
+
+    /**
      * Start watching for git commits
      */
-    startWatching(): void {
+    async startWatching(): Promise<void> {
         if (this.isWatching) {
             return;
         }
+        this.isWatching = true;
 
-        const config = vscode.workspace.getConfiguration('testfox');
-        const autoRunOnCommit = config.get<boolean>('autoRunOnCommit', true);
-
-        if (!autoRunOnCommit) {
-            console.log('TestFox: Auto-run on commit is disabled');
+        const git = await this.getGitAPI();
+        if (!this.isWatching) {
+            return; // Stopped while the Git extension was activating
+        }
+        if (!git) {
+            this.isWatching = false;
+            this.outputChannel.appendLine('⚠️ VS Code Git extension not available - auto-run on commit is inactive');
             return;
         }
 
-        this.isWatching = true;
+        git.repositories.forEach(repo => this.watchRepository(repo));
+        this.apiListeners.push(
+            git.onDidOpenRepository(repo => this.watchRepository(repo)),
+            git.onDidCloseRepository(repo => this.unwatchRepository(repo))
+        );
+
         this.outputChannel.appendLine('🔍 Watching for git commits...');
-
-        // Check for commits every 5 seconds
-        this.checkInterval = setInterval(() => {
-            this.checkForNewCommits();
-        }, 5000);
-
-        // Also listen to VS Code Git events if available
-        this.setupVSCodeGitListener();
     }
 
     /**
      * Stop watching for git commits
      */
     stopWatching(): void {
-        this.isWatching = false;
-        if (this.checkInterval) {
-            clearInterval(this.checkInterval);
-            this.checkInterval = null;
+        if (!this.isWatching) {
+            return;
         }
+        this.isWatching = false;
+
+        this.apiListeners.forEach(listener => listener.dispose());
+        this.apiListeners = [];
+        this.repoListeners.forEach(listener => listener.dispose());
+        this.repoListeners.clear();
+        this.lastHeads.clear();
+
         this.outputChannel.appendLine('🛑 Stopped watching for git commits');
     }
 
     /**
-     * Check if there's a new commit
+     * Get the built-in Git extension API, activating the extension if needed
      */
-    private async checkForNewCommits(): Promise<void> {
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        if (!workspaceFolders || workspaceFolders.length === 0) {
+    private async getGitAPI(): Promise<GitAPI | undefined> {
+        const gitExtension = vscode.extensions.getExtension<{ getAPI(version: 1): GitAPI }>('vscode.git');
+        if (!gitExtension) {
+            return undefined;
+        }
+
+        try {
+            const exports = gitExtension.isActive ? gitExtension.exports : await gitExtension.activate();
+            return exports.getAPI(1);
+        } catch (error) {
+            console.error('TestFox: Failed to get VS Code Git API:', error);
+            return undefined;
+        }
+    }
+
+    private watchRepository(repo: GitRepository): void {
+        const key = repo.rootUri.toString();
+        if (this.repoListeners.has(key)) {
             return;
         }
 
-        const workspacePath = workspaceFolders[0].uri.fsPath;
-        const gitHeadPath = path.join(workspacePath, '.git', 'HEAD');
+        this.lastHeads.set(key, { ...repo.state.HEAD });
+        this.repoListeners.set(key, repo.state.onDidChange(() => this.onRepositoryChanged(repo)));
+    }
 
-        if (!fs.existsSync(gitHeadPath)) {
-            return; // Not a git repository
-        }
-
-        try {
-            const currentCommit = await this.getCurrentCommit(workspacePath);
-            
-            if (currentCommit && currentCommit !== this.lastCommitHash) {
-                // New commit detected!
-                if (this.lastCommitHash !== null) {
-                    this.outputChannel.appendLine(`📝 New commit detected: ${currentCommit.substring(0, 7)}`);
-                    await this.onNewCommit(currentCommit);
-                }
-                this.lastCommitHash = currentCommit;
-            }
-        } catch (error) {
-            console.error('TestFox: Error checking for commits:', error);
-        }
+    private unwatchRepository(repo: GitRepository): void {
+        const key = repo.rootUri.toString();
+        this.repoListeners.get(key)?.dispose();
+        this.repoListeners.delete(key);
+        this.lastHeads.delete(key);
     }
 
     /**
-     * Get current commit hash
+     * Detect a new commit on the current branch
      */
-    private async getCurrentCommit(workspacePath: string): Promise<string | null> {
-        try {
-            // Try VS Code Git API first
-            const gitExtension = vscode.extensions.getExtension('vscode.git');
-            if (gitExtension && gitExtension.isActive) {
-                const git = gitExtension.exports.getAPI(1);
-                const repositories = git.repositories;
-                
-                if (repositories.length > 0) {
-                    const repo = repositories[0];
-                    const head = repo.state.HEAD;
-                    return head?.commit || null;
-                }
-            }
+    private onRepositoryChanged(repo: GitRepository): void {
+        const key = repo.rootUri.toString();
+        const previous = this.lastHeads.get(key);
+        const current: HeadSnapshot = { ...repo.state.HEAD };
 
-            // Fallback: read .git/HEAD
-            const headPath = path.join(workspacePath, '.git', 'HEAD');
-            if (fs.existsSync(headPath)) {
-                const headContent = fs.readFileSync(headPath, 'utf-8').trim();
-                if (headContent.startsWith('ref: ')) {
-                    const refPath = path.join(workspacePath, '.git', headContent.substring(5));
-                    if (fs.existsSync(refPath)) {
-                        return fs.readFileSync(refPath, 'utf-8').trim();
-                    }
-                } else {
-                    return headContent;
-                }
-            }
-        } catch (error) {
-            console.error('TestFox: Failed to get commit:', error);
+        if (!current.commit || current.commit === previous?.commit) {
+            return;
         }
-        return null;
-    }
 
-    /**
-     * Setup VS Code Git extension listener
-     */
-    private setupVSCodeGitListener(): void {
-        try {
-            const gitExtension = vscode.extensions.getExtension('vscode.git');
-            if (gitExtension && gitExtension.isActive) {
-                const git = gitExtension.exports.getAPI(1);
-                
-                // Listen for repository state changes
-                git.onDidChangeState?.(() => {
-                    this.checkForNewCommits();
-                });
+        // Record the new HEAD before prompting, so further state change
+        // events for the same commit don't trigger duplicate prompts
+        this.lastHeads.set(key, current);
 
-                // Listen for specific repository changes
-                git.repositories.forEach((repo: any) => {
-                    repo.state.onDidChange?.(() => {
-                        this.checkForNewCommits();
-                    });
-                });
-            }
-        } catch (error) {
-            console.log('TestFox: VS Code Git API not available, using polling fallback');
+        if (!isNewCommit(previous, current)) {
+            return;
         }
+
+        this.outputChannel.appendLine(`📝 New commit detected: ${current.commit.substring(0, 7)}`);
+        this.onNewCommit(current.commit).catch(error => {
+            console.error('TestFox: Error handling new commit:', error);
+        });
     }
 
     /**
@@ -157,30 +163,25 @@ export class GitCommitHook {
      */
     private async onNewCommit(commitHash: string): Promise<void> {
         const config = vscode.workspace.getConfiguration('testfox');
-        const autoRunOnCommit = config.get<boolean>('autoRunOnCommit', true);
-        const backgroundTestMode = config.get<string>('backgroundTestMode', 'full');
+        const autoRunWithoutPrompts = config.get<boolean>('automation.autoRunWithoutPrompts', false);
 
-        if (!autoRunOnCommit) {
+        if (autoRunWithoutPrompts) {
+            await this.startBackgroundTestRun(commitHash, true);
             return;
         }
 
         this.outputChannel.appendLine(`🚀 Triggering background tests for commit ${commitHash.substring(0, 7)}...`);
 
         // Show notification to user
-        const notification = vscode.window.showInformationMessage(
+        const selection = await vscode.window.showInformationMessage(
             `🦊 TestFox: New commit detected (${commitHash.substring(0, 7)}). Run tests?`,
             'Run Full Cycle',
             'Quick Test',
             'Skip'
         );
 
-        const selection = await notification;
-        
         if (selection === 'Run Full Cycle' || selection === 'Quick Test') {
-            const isFullCycle = selection === 'Run Full Cycle';
-            
-            // Start background test run
-            await this.startBackgroundTestRun(commitHash, isFullCycle);
+            await this.startBackgroundTestRun(commitHash, selection === 'Run Full Cycle');
         } else {
             this.outputChannel.appendLine('⏭️ User skipped tests for this commit');
         }
@@ -194,23 +195,18 @@ export class GitCommitHook {
             this.outputChannel.appendLine(`▶️ Starting ${isFullCycle ? 'full cycle' : 'quick'} background test run...`);
             this.outputChannel.show(true);
 
-            // Import and run tests
-            const { runBackgroundTests } = require('./backgroundTestRunner');
-            
-            const result = await runBackgroundTests({
+            await runBackgroundTests({
                 context: this.context,
                 commitHash,
                 isFullCycle,
                 outputChannel: this.outputChannel,
-                onProgress: (progress: any) => {
+                onProgress: (progress) => {
                     this.updateStatusBar(progress);
                 },
-                onComplete: (result: any) => {
+                onComplete: (result) => {
                     this.onTestRunComplete(result);
                 }
             });
-
-            return result;
         } catch (error) {
             this.outputChannel.appendLine(`❌ Background test run failed: ${error}`);
             vscode.window.showErrorMessage(`TestFox: Background tests failed - ${error}`);
@@ -222,48 +218,44 @@ export class GitCommitHook {
      */
     private updateStatusBar(progress: { completed: number; total: number; currentTest?: string }): void {
         const percent = Math.round((progress.completed / progress.total) * 100);
-        
+
         // Update status bar item if available
-        try {
-            vscode.commands.executeCommand('testfox.updateStatus', {
-                status: 'running',
-                progress: percent,
-                currentTest: progress.currentTest
-            });
-        } catch (error) {
+        vscode.commands.executeCommand('testfox.updateStatus', {
+            status: 'running',
+            progress: percent,
+            currentTest: progress.currentTest
+        }).then(undefined, () => {
             // Status update failed, ignore
-        }
+        });
     }
 
     /**
      * Handle test run completion
      */
-    private async onTestRunComplete(result: any): Promise<void> {
+    private async onTestRunComplete(result: BackgroundTestResult): Promise<void> {
         const { total, passed, failed, skipped, reportPath } = result;
-        
+
         this.outputChannel.appendLine(`\n✅ Test Run Complete!`);
         this.outputChannel.appendLine(`   Total: ${total}`);
         this.outputChannel.appendLine(`   Passed: ${passed}`);
         this.outputChannel.appendLine(`   Failed: ${failed}`);
         this.outputChannel.appendLine(`   Skipped: ${skipped}`);
-        
+
         if (reportPath) {
             this.outputChannel.appendLine(`   Report: ${reportPath}`);
         }
 
         // Show completion notification
-        const passRate = Math.round((passed / total) * 100);
+        const passRate = total > 0 ? Math.round((passed / total) * 100) : 0;
         const icon = failed === 0 ? '✅' : '⚠️';
-        
-        const notification = vscode.window.showInformationMessage(
+
+        const selection = await vscode.window.showInformationMessage(
             `${icon} TestFox: Background tests complete - ${passRate}% passed (${passed}/${total})`,
             'View Report',
             'Open Dashboard',
             'Dismiss'
         );
 
-        const selection = await notification;
-        
         if (selection === 'View Report' && reportPath) {
             const uri = vscode.Uri.file(reportPath);
             await vscode.env.openExternal(uri);

@@ -1521,9 +1521,14 @@ export async function activate(context: vscode.ExtensionContext) {
                         }
                 }
 
-                    if (e.affectsConfiguration('testfox.automation') || 
-                        e.affectsConfiguration('testfox.scheduleEnabled') ||
-                        e.affectsConfiguration('testfox.autoRunOnCommit')) {
+                    if (e.affectsConfiguration('testfox.autoRunOnCommit') && gitCommitHook) {
+                        gitCommitHook.refresh().catch(error => {
+                            console.error('TestFox: Error updating Git Commit Hook:', error);
+                        });
+                    }
+
+                    if (e.affectsConfiguration('testfox.automation') ||
+                        e.affectsConfiguration('testfox.scheduleEnabled')) {
                         try {
                     console.log('Automation settings changed, updating scheduler...');
                             if (scheduler) {
@@ -1548,6 +1553,19 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     try {
+        // Initialize Git Commit Hook for automatic test runs on commit.
+        // Done before auto-initialization, which can wait on user prompts.
+        console.log('Initializing Git Commit Hook...');
+        gitCommitHook = new GitCommitHook(context);
+        gitCommitHook.refresh().catch(error => {
+            console.error('Failed to start Git Commit Hook:', error);
+        });
+        console.log('Git Commit Hook initialized');
+    } catch (error) {
+        console.error('Failed to initialize Git Commit Hook:', error);
+    }
+
+    try {
         // Auto-initialize on activation
         console.log('Starting auto-initialization...');
         await autoInitialize(context);
@@ -1565,16 +1583,6 @@ export async function activate(context: vscode.ExtensionContext) {
         console.log('Test scheduler started');
     } catch (error) {
         console.error('Failed to start scheduler:', error);
-    }
-
-    try {
-        // Initialize Git Commit Hook for automatic test runs on commit
-        console.log('Initializing Git Commit Hook...');
-        gitCommitHook = new GitCommitHook(context);
-        gitCommitHook.startWatching();
-        console.log('Git Commit Hook initialized and watching');
-    } catch (error) {
-        console.error('Failed to initialize Git Commit Hook:', error);
     }
 
     try {
